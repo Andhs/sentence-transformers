@@ -26,7 +26,7 @@ def bert_embed(output_file, input_file):
     with open(input_file, "r", encoding='utf-8-sig') as fin:
         lines = open(fin, 'r', encoding='utf-8-sig').readlines()
         
-    embed_result = open(input_file[:-4] + ".emb", "wb")
+    embed_result = open(output_file, "wb")
     
     model.encode(lines).tofile(embed_result)
 
