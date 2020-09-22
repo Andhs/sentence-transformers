@@ -20,7 +20,7 @@ def bert_embed(output_file, input_file):
         print("")
 
     with open(input_file, "r", encoding='utf-8-sig') as fin:
-        lines = open(fin, 'r', encoding='utf-8-sig').readlines()
+        lines = fin.readlines()
         
     embed_result = open(output_file, "wb")
     
