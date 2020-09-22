@@ -1,6 +1,7 @@
 from sentence_transformers import SentenceTransformer, LoggingHandler
 import numpy as np
 import logging
+import argparse
 
 def bert_embed(output_file, input_file):
     # Load pre-trained Sentence Transformer Model (based on DistilBERT). It will be downloaded automatically
