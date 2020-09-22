@@ -7,18 +7,7 @@ def bert_embed(output_file, input_file):
     # Load pre-trained Sentence Transformer Model (based on DistilBERT). It will be downloaded automatically
     model = SentenceTransformer('distiluse-base-multilingual-cased')
 
-    # Embed a list of sentences
-    sentences = ['This framework generates embeddings for each input sentence',
-                 'Sentences are passed as a list of string.',
-                 'The quick brown fox jumps over the lazy dog.']
-    sentence_embeddings = model.encode(sentences)
-
-    # The result is a list of sentence embeddings as numpy arrays
-    for sentence, embedding in zip(sentences, sentence_embeddings):
-        print("Sentence:", sentence)
-        print("Embedding:", embedding)
-        print("")
-
+    # Embed a list of sentences (from file)
     with open(input_file, "r", encoding='utf-8-sig') as fin:
         lines = fin.readlines()
         
