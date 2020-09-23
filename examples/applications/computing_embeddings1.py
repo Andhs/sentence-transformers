@@ -13,7 +13,7 @@ def bert_embed(output_file, input_file):
         
     embed_result = open(output_file, "wb")
     
-    model.encode(lines, show_progress_bar: True).tofile(embed_result)
+    model.encode(lines, show_progress_bar: bool = True).tofile(embed_result)
 
     embed_result.close()
 
