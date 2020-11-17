@@ -5,7 +5,7 @@ import argparse
 
 def bert_embed(output_file, input_file):
     # Load pre-trained Sentence Transformer Model (based on DistilBERT). It will be downloaded automatically
-    model = SentenceTransformer('distiluse-base-multilingual-cased')
+    model = SentenceTransformer('distiluse-base-multilingual-cased-v2')
 
     # Embed a list of sentences (from file)
     with open(input_file, "r", encoding='utf-8-sig') as fin:
