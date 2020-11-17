@@ -7,14 +7,14 @@ from typing import List, Dict, Tuple, Iterable, Type, Union, Callable
 from zipfile import ZipFile
 import requests
 import numpy as np
+from numpy import ndarray
 import transformers
 import torch
-from numpy import ndarray
 from torch import nn, Tensor, device
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
-from tqdm.autonotebook import tqdm, trange
 import torch.multiprocessing as mp
+from tqdm.autonotebook import tqdm, trange
 import math
 import queue
 
@@ -33,15 +33,19 @@ class SentenceTransformer(nn.Sequential):
     :param modules: This parameter can be used to create custom SentenceTransformer models from scratch.
     :param device: Device (like 'cuda' / 'cpu') that should be used for computation. If None, checks if a GPU can be used.
     """
-
     def __init__(self, model_name_or_path: str = None, modules: Iterable[nn.Module] = None, device: str = None):
         if model_name_or_path is not None and model_name_or_path != "":
             logging.info("Load pretrained SentenceTransformer: {}".format(model_name_or_path))
             model_path = model_name_or_path
 
             if not os.path.isdir(model_path) and not model_path.startswith('http://') and not model_path.startswith('https://'):
-                logging.info("Did not find folder {}. Assume to download model from server.".format(model_path))
+                logging.info("Did not find folder {}".format(model_path))
+
+                if '\\' in model_path or model_path.count('/') > 1:
+                    raise AttributeError("Path {} not found".format(model_path))
+
                 model_path = __DOWNLOAD_SERVER__ + model_path + '.zip'
+                logging.info("Try to download model from server: {}".format(model_path))
 
             if model_path.startswith('http://') or model_path.startswith('https://'):
                 model_url = model_path
@@ -56,20 +60,22 @@ class SentenceTransformer(nn.Sequential):
                             os.getenv('XDG_CACHE_HOME', '~/.cache'), 'torch')))
                 default_cache_path = os.path.join(torch_cache_home, 'sentence_transformers')
                 model_path = os.path.join(default_cache_path, folder_name)
-                os.makedirs(model_path, exist_ok=True)
 
-                if not os.listdir(model_path):
+                if not os.path.exists(model_path) or not os.listdir(model_path):
                     if model_url[-1] == "/":
                         model_url = model_url[:-1]
                     logging.info("Downloading sentence transformer model from {} and saving it at {}".format(model_url, model_path))
+
+                    model_path_tmp = model_path.rstrip("/").rstrip("\\")+"_part"
                     try:
-                        zip_save_path = os.path.join(model_path, 'model.zip')
+                        zip_save_path = os.path.join(model_path_tmp, 'model.zip')
                         http_get(model_url, zip_save_path)
                         with ZipFile(zip_save_path, 'r') as zip:
-                            zip.extractall(model_path)
+                            zip.extractall(model_path_tmp)
                         os.remove(zip_save_path)
+                        os.rename(model_path_tmp, model_path)
                     except requests.exceptions.HTTPError as e:
-                        shutil.rmtree(model_path)
+                        shutil.rmtree(model_path_tmp)
                         if e.response.status_code == 404:
                             logging.warning('SentenceTransformer-Model {} not found. Try to create it from scratch'.format(model_url))
                             logging.warning('Try to create Transformer Model {} with mean pooling'.format(model_name_or_path))
@@ -130,8 +136,6 @@ class SentenceTransformer(nn.Sequential):
                num_workers: int = 0) -> Union[List[Tensor], ndarray, Tensor]:
         """
         Computes sentence embeddings
-
-
         :param sentences: the sentences to embed
         :param batch_size: the batch size used for the computation
         :param show_progress_bar: Output a progress bar when encode sentences
@@ -159,7 +163,7 @@ class SentenceTransformer(nn.Sequential):
         self.to(device)
 
         all_embeddings = []
-        length_sorted_idx = np.argsort([len(sen) for sen in sentences])
+        length_sorted_idx = np.argsort([self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[idx] for idx in length_sorted_idx]
         inp_dataset = EncodeDataset(sentences_sorted, model=self, is_tokenized=is_pretokenized)
         inp_dataloader = DataLoader(inp_dataset, batch_size=batch_size, collate_fn=self.smart_batching_collate_text_only, num_workers=num_workers, shuffle=False)
@@ -182,15 +186,21 @@ class SentenceTransformer(nn.Sequential):
                     input_mask_expanded = input_mask.unsqueeze(-1).expand(embeddings.size()).float()
                     embeddings = embeddings * input_mask_expanded
 
-                all_embeddings.extend(embeddings)
+                embeddings = embeddings.detach()
 
+                # fixes for #522 and #487
+                # to avoid oom problems on gpu with large datasets
+                if convert_to_numpy:
+                    embeddings = embeddings.cpu()
+
+                all_embeddings.extend(embeddings)
 
         all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
 
         if convert_to_tensor:
             all_embeddings = torch.stack(all_embeddings)
         elif convert_to_numpy:
-            all_embeddings = np.asarray([emb.cpu().detach().numpy() for emb in all_embeddings])
+            all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
 
         if input_was_string:
             all_embeddings = all_embeddings[0]
@@ -247,7 +257,7 @@ class SentenceTransformer(nn.Sequential):
         pool['output'].close()
 
 
-    def encode_multi_process(self, sentences: List[str], pool: Dict[str, object], is_pretokenized: bool = False):
+    def encode_multi_process(self, sentences: List[str], pool: Dict[str, object], is_pretokenized: bool = False, chunk_size=None):
         """
         This method allows to run encode() on multiple GPUs. The sentences are chunked into smaller packages
         and sent to individual processes, which encode these on the different GPUs. This method is only suitable
@@ -256,34 +266,32 @@ class SentenceTransformer(nn.Sequential):
         :param sentences: List of sentences
         :param pool: A pool of workers started with SentenceTransformer.start_multi_process_pool
         :param is_pretokenized: If true, no tokenization will be applied. It is expected that the input sentences are list of ints.
+        :param chunk_size: Sentences are chunked and sent to the individual processes. If none, it determine a sensible size.
         :return: Numpy matrix with all embeddings
         """
 
-        chunk_size = min(math.ceil(len(sentences) / len(pool["processes"]) / 10), 5000)
+        if chunk_size is None:
+            chunk_size = min(math.ceil(len(sentences) / len(pool["processes"]) / 10), 5000)
+
         logging.info("Chunk data into packages of size {}".format(chunk_size))
 
-        if is_pretokenized:
-            sentences_tokenized = sentences
-        else:
-            sentences_tokenized = map(self.tokenize, sentences)
-
         input_queue = pool['input']
-        num_chunks = 0
+        last_chunk_id = 0
         chunk = []
 
-        for sentence in sentences_tokenized:
+        for sentence in sentences:
             chunk.append(sentence)
             if len(chunk) >= chunk_size:
-                input_queue.put([num_chunks, chunk])
-                num_chunks += 1
+                input_queue.put([last_chunk_id, is_pretokenized, chunk])
+                last_chunk_id += 1
                 chunk = []
 
         if len(chunk) > 0:
-            input_queue.put([num_chunks, chunk])
-            num_chunks += 1
+            input_queue.put([last_chunk_id, is_pretokenized, chunk])
+            last_chunk_id += 1
 
         output_queue = pool['output']
-        results_list = sorted([output_queue.get() for _ in range(num_chunks)], key=lambda x: x[0])
+        results_list = sorted([output_queue.get() for _ in range(last_chunk_id)], key=lambda x: x[0])
         embeddings = np.concatenate([result[1] for result in results_list])
         return embeddings
 
@@ -294,8 +302,8 @@ class SentenceTransformer(nn.Sequential):
         """
         while True:
             try:
-                id, sentences = input_queue.get()
-                embeddings = model.encode(sentences, device=target_device, is_pretokenized=True, show_progress_bar=False, convert_to_numpy=True, batch_size=encode_batch_size)
+                id, is_pretokenized, sentences = input_queue.get()
+                embeddings = model.encode(sentences, device=target_device, is_pretokenized=is_pretokenized, show_progress_bar=False, convert_to_numpy=True, batch_size=encode_batch_size)
                 results_queue.put([id, embeddings])
             except queue.Empty:
                 break
@@ -320,7 +328,11 @@ class SentenceTransformer(nn.Sequential):
         return self._first_module().get_sentence_features(*features)
 
     def get_sentence_embedding_dimension(self):
-        return self._last_module().get_sentence_embedding_dimension()
+        for mod in reversed(self._modules.values()):
+            sent_embedding_dim_method = getattr(mod, "get_sentence_embedding_dimension", None)
+            if callable(sent_embedding_dim_method):
+                return sent_embedding_dim_method()
+        return None
 
     def _first_module(self):
         """Returns the first module of this sequential embedder"""
@@ -336,6 +348,8 @@ class SentenceTransformer(nn.Sequential):
         """
         if path is None:
             return
+
+        os.makedirs(path, exist_ok=True)
 
         logging.info("Save model to {}".format(path))
         contained_modules = []
@@ -356,6 +370,7 @@ class SentenceTransformer(nn.Sequential):
     def smart_batching_collate(self, batch):
         """
         Transforms a batch from a SmartBatchingDataset to a batch of tensors for the model
+        Here, batch is a list of tuples: [(tokens, label), ...]
 
         :param batch:
             a batch from a SmartBatchingDataset
@@ -371,7 +386,7 @@ class SentenceTransformer(nn.Sequential):
             labels.append(label)
             for i in range(num_texts):
                 paired_texts[i].append(tokens[i])
-                max_seq_len[i] = max(max_seq_len[i], len(tokens[i]))
+                max_seq_len[i] = max(max_seq_len[i], self._text_length(tokens[i]))
 
         features = []
         for idx in range(num_texts):
@@ -389,7 +404,6 @@ class SentenceTransformer(nn.Sequential):
 
 
             for feature_name in feature_lists:
-                #feature_lists[feature_name] = torch.tensor(np.asarray(feature_lists[feature_name]))
                 feature_lists[feature_name] = torch.cat(feature_lists[feature_name])
 
             features.append(feature_lists)
@@ -399,7 +413,8 @@ class SentenceTransformer(nn.Sequential):
 
     def smart_batching_collate_text_only(self, batch):
         """
-        Transforms a batch from a SmartBatchingDataset to a batch of tensors for the model
+        Transforms a batch from a SmartBatchingDataset to a batch of tensors for the model.
+        Here, batch is a list of texts
 
         :param batch:
             a batch from a SmartBatchingDataset
@@ -407,7 +422,7 @@ class SentenceTransformer(nn.Sequential):
             a batch of tensors for the model
         """
 
-        max_seq_len = max([len(text) for text in batch])
+        max_seq_len = max([self._text_length(text) for text in batch])
         feature_lists = {}
 
         for text in batch:
@@ -423,11 +438,20 @@ class SentenceTransformer(nn.Sequential):
 
         return feature_lists
 
-
+    def _text_length(self, text: Union[List[int], List[List[int]]]):
+        """
+        Help function to get the length for the input text. Text can be either
+        a list of ints (which means a single text as input), or a tuple of list of ints
+        (representing several text inputs to the model).
+        """
+        if len(text) == 0 or isinstance(text[0], int):
+            return len(text)
+        else:
+            return sum([len(t) for t in text])
 
     def fit(self,
             train_objectives: Iterable[Tuple[DataLoader, nn.Module]],
-            evaluator: SentenceEvaluator,
+            evaluator: SentenceEvaluator = None,
             epochs: int = 1,
             steps_per_epoch = None,
             scheduler: str = 'WarmupLinear',
@@ -437,11 +461,11 @@ class SentenceTransformer(nn.Sequential):
             weight_decay: float = 0.01,
             evaluation_steps: int = 0,
             output_path: str = None,
-            output_path_ignore_not_empty: bool = False,
             save_best_model: bool = True,
             max_grad_norm: float = 1,
             use_amp: bool = False,
             callback: Callable[[float, int, int], None] = None,
+            output_path_ignore_not_empty: bool = False
             ):
         """
         Train the model with the given training objective
@@ -460,13 +484,13 @@ class SentenceTransformer(nn.Sequential):
         :param weight_decay: Weight decay for model parameters
         :param evaluation_steps: If > 0, evaluate the model using evaluator after each number of training steps
         :param output_path: Storage path for the model and evaluation files
-        :param output_path_ignore_not_empty: By default, training will stop if output_path is not empty. If set to true, this error will be ignored and training proceeds.
         :param save_best_model: If true, the best model (according to evaluator) is stored at output_path
         :param max_grad_norm: Used for gradient normalization.
         :param use_amp: Use Automatic Mixed Precision (AMP). Only for Pytorch >= 1.6.0
         :param callback: Callback function that is invoked after each evaluation.
                 It must accept the following three parameters in this order:
                 `score`, `epoch`, `steps`
+        :param output_path_ignore_not_empty: deprecated, no longer used
         """
 
         if use_amp:
@@ -477,9 +501,6 @@ class SentenceTransformer(nn.Sequential):
 
         if output_path is not None:
             os.makedirs(output_path, exist_ok=True)
-            if not output_path_ignore_not_empty and len(os.listdir(output_path)) > 0:
-                raise ValueError("Output directory ({}) already exists and is not empty.".format(
-                    output_path))
 
         dataloaders = [dataloader for dataloader, _ in train_objectives]
 
@@ -488,10 +509,8 @@ class SentenceTransformer(nn.Sequential):
             dataloader.collate_fn = self.smart_batching_collate
 
         loss_models = [loss for _, loss in train_objectives]
-        device = self._target_device
-
         for loss_model in loss_models:
-            loss_model.to(device)
+            loss_model.to(self._target_device)
 
         self.best_score = -9999999
 
@@ -569,8 +588,8 @@ class SentenceTransformer(nn.Sequential):
 
                     optimizer.zero_grad()
 
-                if not skip_scheduler:
-                    scheduler.step()
+                    if not skip_scheduler:
+                        scheduler.step()
 
                 training_steps += 1
                 global_step += 1
@@ -582,8 +601,7 @@ class SentenceTransformer(nn.Sequential):
                         loss_model.zero_grad()
                         loss_model.train()
 
-            self._eval_during_training(evaluator, output_path, save_best_model, epoch,
-                                       -1, callback)
+            self._eval_during_training(evaluator, output_path, save_best_model, epoch, -1, callback)
 
     def evaluate(self, evaluator: SentenceEvaluator, output_path: str = None):
         """
@@ -604,12 +622,14 @@ class SentenceTransformer(nn.Sequential):
             score = evaluator(self, output_path=output_path, epoch=epoch, steps=steps)
             if callback is not None:
                 callback(score, epoch, steps)
-            if score > self.best_score and save_best_model:
-                self.save(output_path)
+            if score > self.best_score:
                 self.best_score = score
+                if save_best_model:
+                    self.save(output_path)
 
 
-    def _get_scheduler(self, optimizer, scheduler: str, warmup_steps: int, t_total: int):
+    @staticmethod
+    def _get_scheduler(optimizer, scheduler: str, warmup_steps: int, t_total: int):
         """
         Returns the correct learning rate scheduler. Available scheduler: constantlr, warmupconstant, warmuplinear, warmupcosine, warmupcosinewithhardrestarts
         """

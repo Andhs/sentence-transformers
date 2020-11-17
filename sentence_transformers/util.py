@@ -1,6 +1,6 @@
 import requests
 from torch import Tensor, device
-from typing import Tuple, List
+from typing import List
 from tqdm import tqdm
 import sys
 import importlib
@@ -8,7 +8,7 @@ import os
 import torch
 import numpy as np
 import queue
-import logging
+
 
 def pytorch_cos_sim(a: Tensor, b: Tensor):
     """
@@ -150,6 +150,9 @@ def semantic_search(query_embeddings: Tensor,
     #Normalize scores, so that the dot-product is equivalent to cosine similarity
     query_embeddings = query_embeddings / query_embeddings.norm(dim=1)[:, None]
     corpus_embeddings = corpus_embeddings / corpus_embeddings.norm(dim=1)[:, None]
+
+    if corpus_embeddings.device != query_embeddings.device:
+        corpus_embeddings = corpus_embeddings.to(query_embeddings.device)
 
     queries_result_list = [[] for _ in range(len(query_embeddings))]
 
